@@ -1,0 +1,9 @@
+{
+    "makefile.launchConfigurations": [
+        {
+            "cwd": "/home/kimtuyer/projects/linux_study",
+            "binaryPath": "/home/kimtuyer/projects/linux_study/open",
+            "binaryArgs": []
+        }
+    ]
+}
