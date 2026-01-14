@@ -1,4 +1,5 @@
 #pragma once
+#define PCAP_DONT_INCLUDE_PCAP_BPF_H
 #include <pcap.h>
 #include <thread>
 #include <vector>
@@ -13,24 +14,40 @@
 //#include <tchar.h>
 #include <time.h>
 #include<iostream>
-#include <netinet/ether.h>     // Ethernet 헤더 (struct ethhdr)
-#include <netinet/ip.h>        // IP 헤더 (struct iphdr)
-#include <netinet/tcp.h>       // TCP 헤더 (struct tcphdr)
-#include <arpa/inet.h>         // inet_ntoa 등 주소 변환 함수
-#include <net/if.h>            // 네트워크 인터페이스 관련
+
 
 
 #include <atomic> // 리눅스에서 필수
 #include <condition_variable>  // 리눅스에서 필수
 
-#define __LINUX__
 #define __VER2__
 #define __OOP__
 #define __DATA_LOADING__
+
+#define __LINUX__
+#define __NETFILTER__
+#define __XDP__
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <libnetfilter_queue/libnetfilter_queue.h>
+#include <linux/netfilter.h> // NF_ACCEPT, NF_DROP 정의
+#include <netinet/in.h>
+#include <netinet/ether.h>     // Ethernet 헤더 (struct ethhdr)
+#include <netinet/ip.h>        // IP 헤더 (struct iphdr)
+#include <netinet/tcp.h>       // TCP 헤더 (struct tcphdr)
+#include <arpa/inet.h>         // inet_ntoa 등 주소 변환 함수
+#include <net/if.h>            // 네트워크 인터페이스 관련
 using namespace std;
 
-const int NUM_WORKER_THREADS = 8;
+const int NUM_WORKER_THREADS = 4;
 const int TIME_WAIT = 1000;
+
+enum eMode
+{
+	MODE_PCAP=1,
+	MODE_NETFILTER
+};
+
 
 #pragma pack(push, 1)
 typedef struct EtherHeader {

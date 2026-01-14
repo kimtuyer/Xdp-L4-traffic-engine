@@ -1,11 +1,16 @@
 #include "PacketDetect.h"
 #include <cinttypes>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 // #include "Global.h"
 
-PacketDetect::PacketDetect(SharedContext &context) : g_ctx(context)
+PacketDetect::PacketDetect(SharedContext &context, int mode) : g_ctx(context), m_mode(mode)
 {
-    for (int i = 0; i < NUM_WORKER_THREADS; i++)
-        ThreadPool.push_back(thread(&PacketDetect::packet_detect, this, i, PcapAdmin.GetHandle()));
+    if (mode == eMode::MODE_PCAP)
+    {
+        for (int i = 0; i < NUM_WORKER_THREADS; i++)
+            ThreadPool.push_back(thread(&PacketDetect::packet_detect, this, i, PcapAdmin.GetHandle()));
+    }
 }
 
 PacketDetect::~PacketDetect()
@@ -194,123 +199,463 @@ void PacketDetect::packet_Reset(const TcpHeader *pTcp, const u_char *pktdata, co
     EtherHeader *pEther = (EtherHeader *)pktdata;
     IpHeader *pSrcIpHeader = (IpHeader *)(pktdata + sizeof(EtherHeader));
 
-    unsigned char frameData[60] = {0}; // 최소 패킷 사이즈
-    EtherHeader *pEtherHeader = (EtherHeader *)frameData;
-    IpHeader *pIpHeader = (IpHeader *)(frameData + sizeof(EtherHeader));
-    TcpHeader *pTcpHeader = (TcpHeader *)(frameData + sizeof(EtherHeader) + 20);
+    // 캡처한 IP 헤더에서 전체 길이를 가져와 TCP 페이로드 길이를 계산
+    // int ipLen = ntohs(pSrcIpHeader->length);
+    // int ipHeaderLen = (pSrcIpHeader->verIhl & 0x0F) * 4;
+    // int tcpHeaderLen = ((pTcp->data & 0xF0) >> 4) * 4;
+    int payloadLen = ntohs(pSrcIpHeader->length) - ((pSrcIpHeader->verIhl & 0x0F) * 4) - (((pTcp->data & 0xF0) >> 4) * 4);
+    // int payloadLen = ipLen - ipHeaderLen - tcpHeaderLen;
 
-    // 1. Ethernet 설정: 나(VM) -> 클라이언트(Windows)
-    memcpy(pEtherHeader->srcMac, g_ctx.config.gateway_mac, 6); // 내 리눅스 MAC
-    memcpy(pEtherHeader->dstMac, pEther->srcMac, 6);          // 캡처된 패킷의 소스(클라) MAC
-    pEtherHeader->type = htons(0x0800);
+    for (int i = 0; i < 1; i++)
+    {
 
-    // 2. IP 설정: 서버 -> 클라이언트
-    pIpHeader->verIhl = 0x45;
-    pIpHeader->length = htons(40);
-    pIpHeader->protocol = 6;
-    pIpHeader->ttl = 128;
-    memcpy(pIpHeader->srcIp, &g_ctx.config.server_ip_addr, 4); // 서버 IP (가짜 출발지)
-    memcpy(pIpHeader->dstIp, pSrcIpHeader->srcIp, 4);          // 클라이언트 IP
-    pIpHeader->checksum = CalcChecksumIp(pIpHeader);
+        unsigned char frameData[60] = {0}; // 최소 패킷 사이즈
+        EtherHeader *pEtherHeader = (EtherHeader *)frameData;
+        IpHeader *pIpHeader = (IpHeader *)(frameData + sizeof(EtherHeader));
+        TcpHeader *pTcpHeader = (TcpHeader *)(frameData + sizeof(EtherHeader) + 20);
 
-    // 3. TCP 설정 (가장 중요)
-    pTcpHeader->srcPort = htons(g_ctx.config.server_port);     // 서버 포트
-    pTcpHeader->dstPort = pTcp->srcPort;                       // 클라이언트 포트
-    
-    // 캡처한 패킷의 ACK를 나의 SEQ로 사용 (상대방이 기다리는 번호)
-    pTcpHeader->seq = pTcp->ack; 
-    pTcpHeader->ack = 0;
-    pTcpHeader->data = 0x50; 
-    pTcpHeader->flags = 0x04; // RST
-    pTcpHeader->windowSize = 0;
-    pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+        // 1. Ethernet 설정: 나(VM) -> 클라이언트(Windows)
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            memcpy(pEtherHeader->srcMac, pEther->srcMac, 6);
+            memcpy(pEtherHeader->dstMac, g_ctx.config.gateway_mac, 6);
+        }
+        else if (i == DESTINATION::DST_CLI) // 서버->클라
+        {
+            memcpy(pEtherHeader->srcMac, g_ctx.config.gateway_mac, 6); // 내 리눅스 MAC
+            memcpy(pEtherHeader->dstMac, pEther->srcMac, 6);           // 캡처된 패킷의 소스(클라) MAC
+        }
+        pEtherHeader->type = htons(0x0800);
 
-    // 4. 전송
-    pcap_sendpacket(const_cast<pcap_t *>(adhandle), frameData, 54);
-//     EtherHeader *pEther = (EtherHeader *)pktdata;
-//     IpHeader *pSrcIpHeader = (IpHeader *)(pktdata + sizeof(EtherHeader));
+        // 2. IP 설정: 서버 -> 클라이언트
+        pIpHeader->verIhl = 0x45;
+        pIpHeader->length = htons(40);
+        pIpHeader->protocol = 6;
+        pIpHeader->ttl = 128;
 
-//     unsigned char frameData[1514] = {0};
-//     IpHeader *pIpHeader = (IpHeader *)(frameData + sizeof(EtherHeader));
-//     int ipHeaderLen = 20;
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            memcpy(pIpHeader->srcIp, pSrcIpHeader->srcIp, 4);
+            memcpy(pIpHeader->dstIp, &g_ctx.config.server_ip_addr, 4);
+        }
+        else if (i == DESTINATION::DST_CLI)
+        {
 
-//     TcpHeader *pTcpHeader =
-//         (TcpHeader *)(frameData + sizeof(EtherHeader) + ipHeaderLen);
-//     EtherHeader *pEtherHeader = (EtherHeader *)frameData;
-// #ifdef __DATA_LOADING__
+            memcpy(pIpHeader->srcIp, &g_ctx.config.server_ip_addr, 4); // 서버 IP (가짜 출발지)
+            memcpy(pIpHeader->dstIp, pSrcIpHeader->srcIp, 4);          // 클라이언트 IP
+        }
+        pIpHeader->checksum = CalcChecksumIp(pIpHeader);
 
-//     // MAC 주소 설정
-//     memcpy(pEtherHeader->srcMac, pEther->srcMac, 6);           // 패킷에 담긴 클라 mac 주소
-//     memcpy(pEtherHeader->dstMac, g_ctx.config.gateway_mac, 6); // 전송할 서버 mac 주소
+        pTcpHeader->data = 0x50;
+        pTcpHeader->flags = 0x04; // RST
+        pTcpHeader->windowSize = 0;
+        pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+        // 3. TCP 설정 (가장 중요)
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            pTcpHeader->srcPort = pTcp->srcPort;
+            pTcpHeader->dstPort = htons(g_ctx.config.server_port);
 
-//     // IP 설정
-//     // m_config.server_ip_addr은 이미 Network Order로 변환되어 있으므로 그대로 복사
-//     memcpy(pIpHeader->dstIp, &g_ctx.config.server_ip_addr, 4);
-//     memcpy(pIpHeader->srcIp, pSrcIpHeader->srcIp, 4);
+            uint32_t baseSeq = ntohl(pTcp->seq) + payloadLen;
 
-//     // Port 설정
-//     pTcpHeader->dstPort = htons(g_ctx.config.server_port);
-// #else
+            // uint32_t s_nextSeq = ntohl(pTcp->seq) + payloadLen;
+            // pTcpHeader->seq = htonl(s_nextSeq);
+            pTcpHeader->ack = pTcp->ack; // 기존 ACK 유지
+            // pTcpHeader->seq = pTcp->seq;
+            for (int burst = 0; burst < 3; burst++)
+            {
+                pTcpHeader->seq = htonl(baseSeq + (burst)); // 100바이트 간격으로 타격
+                pcap_sendpacket(const_cast<pcap_t *>(adhandle), frameData, 54);
+            }
+        }
+        else if (i == DESTINATION::DST_CLI)
+        {
 
-//     int msgSize = 0;
-//     pEtherHeader->dstMac[0] = 0x00;
-//     pEtherHeader->dstMac[1] = 0x0C;
-//     pEtherHeader->dstMac[2] = 0x29;
-//     pEtherHeader->dstMac[3] = 0x72;
-//     pEtherHeader->dstMac[4] = 0x01;
-//     pEtherHeader->dstMac[5] = 0x51;
+            pTcpHeader->srcPort = htons(g_ctx.config.server_port); // 서버 포트
+            pTcpHeader->dstPort = pTcp->srcPort;                   // 클라이언트 포트
+            // 캡처한 패킷의 ACK를 나의 SEQ로 사용 (상대방이 기다리는 번호)
+            pTcpHeader->seq = pTcp->ack;
+            pTcpHeader->ack = 0;
 
-//     pEtherHeader->srcMac[0] = 0x00;
-//     pEtherHeader->srcMac[1] = 0x50;
-//     pEtherHeader->srcMac[2] = 0x56;
-//     pEtherHeader->srcMac[3] = 0xC0;
-//     pEtherHeader->srcMac[4] = 0x00;
-//     pEtherHeader->srcMac[5] = 0x01;
-// #endif // __DATA_LOADING__
+            // 4. 전송
+            pcap_sendpacket(const_cast<pcap_t *>(adhandle), frameData, 54);
+        }
+    }
+    //     EtherHeader *pEther = (EtherHeader *)pktdata;
+    //     IpHeader *pSrcIpHeader = (IpHeader *)(pktdata + sizeof(EtherHeader));
 
-//     pEtherHeader->type = htons(0x0800);
+    //     unsigned char frameData[1514] = {0};
+    //     IpHeader *pIpHeader = (IpHeader *)(frameData + sizeof(EtherHeader));
+    //     int ipHeaderLen = 20;
 
-//     // IpHeader* pIpHeader = (IpHeader*)(frameData + sizeof(EtherHeader));
-//     pIpHeader->verIhl = 0x45;
-//     pIpHeader->tos = 0x00;
-//     pIpHeader->length = htons(40);
-//     pIpHeader->id = 0x3412;
-//     pIpHeader->fragOffset = htons(0x4000); // DF
-//     pIpHeader->ttl = 0xFF;
-//     pIpHeader->protocol = 6; // TCP
-//     pIpHeader->checksum = 0x0000;
+    //     TcpHeader *pTcpHeader =
+    //         (TcpHeader *)(frameData + sizeof(EtherHeader) + ipHeaderLen);
+    //     EtherHeader *pEtherHeader = (EtherHeader *)frameData;
+    // #ifdef __DATA_LOADING__
 
-// #ifdef __DATA_LOADING__
-// #else
-//     pIpHeader->srcIp[0] = 192;
-//     pIpHeader->srcIp[1] = 168;
-//     pIpHeader->srcIp[2] = 41;
-//     pIpHeader->srcIp[3] = 1;
+    //     // MAC 주소 설정
+    //     memcpy(pEtherHeader->srcMac, pEther->srcMac, 6);           // 패킷에 담긴 클라 mac 주소
+    //     memcpy(pEtherHeader->dstMac, g_ctx.config.gateway_mac, 6); // 전송할 서버 mac 주소
 
-//     pIpHeader->dstIp[0] = 192;
-//     pIpHeader->dstIp[1] = 168;
-//     pIpHeader->dstIp[2] = 41;
-//     pIpHeader->dstIp[3] = 128;
-//     pTcpHeader->dstPort = htons(25000);
-// #endif
+    //     // IP 설정
+    //     // m_config.server_ip_addr은 이미 Network Order로 변환되어 있으므로 그대로 복사
+    //     memcpy(pIpHeader->dstIp, &g_ctx.config.server_ip_addr, 4);
+    //     memcpy(pIpHeader->srcIp, pSrcIpHeader->srcIp, 4);
 
-//     pTcpHeader->srcPort = htons(ntohs(pTcp->srcPort)); // 반드시 일치
-//     pTcpHeader->seq = (pTcp->seq);                     // 반드시 일치 , pTcp->seq 값은 이미 Net-order 순서이므로 변환없이 그대로 복사
-//     pTcpHeader->ack = 0;
-//     pTcpHeader->data = 0x50;
-//     pTcpHeader->flags = 0x04; // RST
-//     pTcpHeader->windowSize = 0;
-//     pTcpHeader->checksum = 0x0000;
-//     pTcpHeader->urgent = 0;
+    //     // Port 설정
+    //     pTcpHeader->dstPort = htons(g_ctx.config.server_port);
+    // #else
 
-//     pIpHeader->checksum = CalcChecksumIp(pIpHeader);
-//     pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+    //     int msgSize = 0;
+    //     pEtherHeader->dstMac[0] = 0x00;
+    //     pEtherHeader->dstMac[1] = 0x0C;
+    //     pEtherHeader->dstMac[2] = 0x29;
+    //     pEtherHeader->dstMac[3] = 0x72;
+    //     pEtherHeader->dstMac[4] = 0x01;
+    //     pEtherHeader->dstMac[5] = 0x51;
 
-//     /* Send down the packet */
-//     if (pcap_sendpacket(const_cast<pcap_t *>(adhandle), // Adapter
-//                         frameData,                      // buffer with the packet
-//                         sizeof(EtherHeader) + sizeof(IpHeader) + sizeof(TcpHeader)) != 0)
-//     {
-//         fprintf(stderr, "\nError sending the packet: %s\n", pcap_geterr(const_cast<pcap_t *>(adhandle)));
-//     }
+    //     pEtherHeader->srcMac[0] = 0x00;
+    //     pEtherHeader->srcMac[1] = 0x50;
+    //     pEtherHeader->srcMac[2] = 0x56;
+    //     pEtherHeader->srcMac[3] = 0xC0;
+    //     pEtherHeader->srcMac[4] = 0x00;
+    //     pEtherHeader->srcMac[5] = 0x01;
+    // #endif // __DATA_LOADING__
+
+    //     pEtherHeader->type = htons(0x0800);
+
+    //     // IpHeader* pIpHeader = (IpHeader*)(frameData + sizeof(EtherHeader));
+    //     pIpHeader->verIhl = 0x45;
+    //     pIpHeader->tos = 0x00;
+    //     pIpHeader->length = htons(40);
+    //     pIpHeader->id = 0x3412;
+    //     pIpHeader->fragOffset = htons(0x4000); // DF
+    //     pIpHeader->ttl = 0xFF;
+    //     pIpHeader->protocol = 6; // TCP
+    //     pIpHeader->checksum = 0x0000;
+
+    // #ifdef __DATA_LOADING__
+    // #else
+    //     pIpHeader->srcIp[0] = 192;
+    //     pIpHeader->srcIp[1] = 168;
+    //     pIpHeader->srcIp[2] = 41;
+    //     pIpHeader->srcIp[3] = 1;
+
+    //     pIpHeader->dstIp[0] = 192;
+    //     pIpHeader->dstIp[1] = 168;
+    //     pIpHeader->dstIp[2] = 41;
+    //     pIpHeader->dstIp[3] = 128;
+    //     pTcpHeader->dstPort = htons(25000);
+    // #endif
+
+    //     pTcpHeader->srcPort = htons(ntohs(pTcp->srcPort)); // 반드시 일치
+    //     pTcpHeader->seq = (pTcp->seq);                     // 반드시 일치 , pTcp->seq 값은 이미 Net-order 순서이므로 변환없이 그대로 복사
+    //     pTcpHeader->ack = 0;
+    //     pTcpHeader->data = 0x50;
+    //     pTcpHeader->flags = 0x04; // RST
+    //     pTcpHeader->windowSize = 0;
+    //     pTcpHeader->checksum = 0x0000;
+    //     pTcpHeader->urgent = 0;
+
+    //     pIpHeader->checksum = CalcChecksumIp(pIpHeader);
+    //     pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+
+    //     /* Send down the packet */
+    //     if (pcap_sendpacket(const_cast<pcap_t *>(adhandle), // Adapter
+    //                         frameData,                      // buffer with the packet
+    //                         sizeof(EtherHeader) + sizeof(IpHeader) + sizeof(TcpHeader)) != 0)
+    //     {
+    //         fprintf(stderr, "\nError sending the packet: %s\n", pcap_geterr(const_cast<pcap_t *>(adhandle)));
+    //     }
+}
+
+bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_data *nfa)
+{
+
+    IpHeader *pIpHeader = (IpHeader *)pkt_data;
+
+    uint32_t src_ip = *(uint32_t *)(pIpHeader->srcIp);
+
+    int ipHeaderLen = (pIpHeader->verIhl & 0x0F) * 4;
+    TcpHeader *pTcp = (TcpHeader *)(pkt_data + ipHeaderLen);
+
+    // SSH 패킷은 차단 대상에서 제외!
+    if (ntohs(pTcp->dstPort) == 22 || ntohs(pTcp->srcPort) == 22)
+    {
+        return false; // 무조건 ACCEPT
+    }
+    // struct nfqnl_msg_packet_hw *mac = nfq_get_packet_hw(nfa);
+
+    // if (ctx.g_syn_count < 5000)
+    if (g_ctx.g_emergency_mode == false)
+    {
+        int syn_count = g_ctx.g_syn_count;
+        int ack_count = g_ctx.g_ack_count;
+        // ACK 비율 확인
+        if (ack_count < (syn_count * 0.1))
+        {
+            // SYN은 3000개인데 ACK가 300개도 안 옴 -> 공격 의심!
+            // First Packet Drop 모드 ON
+            printf("Emergency mode On!\n");
+            g_ctx.g_emergency_mode = true;
+        }
+    }
+    // // 테스트를 위해, 첫 클라이언트 서버 연결은 허용!
+    // if (pTcp->flags & 0x02)
+    // {
+    //     return false;
+    // }
+
+    // printf("Received Packet from: %u\n", src_ip);
+    //  // 데이터가 들어있는 패킷(채팅 내용 등)만 차단하고 싶다면:
+    //  int payloadLen = ntohs(pIpHeader->length) - ipHeaderLen - (pTcp->data >> 4) * 4;
+    //  if (payloadLen > 0)
+    //  {
+    //      printf("[BLOCK] Data Packet Detected (Len: %d). Dropping...\n", payloadLen);
+    //      // 여기서 Reset을 쏘면 클라이언트가 즉시 튕깁니다.
+    //      // packet_ResetInline(pkt_data, len, nfa, adhandle);
+    //      return true; // DROP
+    //  }
+
+    // if (mac)
+    // {
+    //     uint64_t srcMacKey = MacToUint64(mac->hw_addr);
+    //     std::shared_lock<std::shared_mutex> lock(m_statsMutex);
+    //     m_mac_stat[srcMacKey]++;
+
+    //     if (m_mac_stat[srcMacKey] > 500)
+    //     {
+    //                 return true;
+    //         // 특정 MAC 전체 차단 정책 등 수행
+    //     }
+    // }
+
+    // 1. 주기적 카운트 초기화 (동기식)
+    auto now = std::chrono::steady_clock::now();
+    {
+        // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+        std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+        if (chrono::duration_cast<std::chrono::seconds>(now - m_last_check_time).count() >= 1)
+        {
+            m_last_check_time = now;
+            m_accumulate_stat.clear();
+            m_mac_stat.clear();
+        }
+    }
+    // 2. 패킷 정보 업데이트 (인라인 카운팅)
+    // 인라인 모드에서는 실시간으로 accumlate_stat에 바로 기록합니다.
+    {
+        // std::unique_lock<std::shared_mutex> lock(m_statsMutex);
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        m_accumulate_stat[src_ip].TotalCount++;
+        if (pTcp->flags & 0x02)
+            m_accumulate_stat[src_ip].syn_count++;
+    }
+
+    // 3. 탐지 로직 (기존 if-else 구조 유지)
+
+    {
+        // std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
+        std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+
+        // [검사 1] 블랙리스트 여부 확인 (가장 빠름)
+        if (local_blacklist.contains(src_ip))
+        {
+            printf("blacklist drp: %u\n", src_ip);
+
+            return true; // 즉시 DROP
+        }
+
+        if (m_accumulate_stat[src_ip].syn_count > 10 ||
+            m_accumulate_stat[src_ip].TotalCount > 100)
+        {
+            // read_lock.unlock();
+            printf("[BLOCK] SYN Flood Detected from IP: %u. Dropping...\n", src_ip);
+            // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+            // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+
+            local_blacklist.insert(src_ip); // 블랙리스트 등록
+            UpdateXdpBlcaklist(src_ip);
+
+            return true; // DROP
+        }
+    }
+
+    // [검사 2] Emergency Mode (First Drop / Greylist 로직)
+    if (g_ctx.g_emergency_mode)
+    {
+        if (pTcp->flags & 0x02)
+        { // SYN 패킷일 때만
+            {
+                // std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
+                std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+                                                                // std::shared_lock<std::shared_mutex> lock(m_statsMutex);
+
+                if (m_whitelist.contains(src_ip))
+                {
+                    printf("whitelist Pass: %u\n", src_ip);
+                    return false; // 허용
+                }
+            }
+
+            {
+                // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+                std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+
+                if (m_greylist.contains(src_ip))
+                {
+
+                    printf("whitelist insert: %u\n", src_ip);
+
+                    m_greylist.erase(src_ip);
+                    m_whitelist.insert(src_ip);
+                    return false; // 재전송 확인됨 -> 허용
+                }
+                else
+                {
+                    // First Drop: 기록만 하고 패킷은 버림
+                    m_greylist[src_ip] = now;
+                    printf("greylist insert: %u\n", src_ip);
+
+                    return true; // DROP
+                }
+            }
+        }
+    }
+    // // [검사 3] SYN Flood / DDoS 임계치 체크
+    // {
+    //     std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+    //     // std::shared_lock<std::shared_mutex> read_lock(m_shared_statsMutex);
+    //     if (m_accumulate_stat[src_ip].syn_count > 10 ||
+    //         m_accumulate_stat[src_ip].TotalCount > 100)
+    //     {
+    //         // read_lock.unlock();
+    //         printf("[BLOCK] SYN Flood Detected from IP: %u. Dropping...\n", src_ip);
+    //         // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+    //         // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+
+    //         local_blacklist.insert(src_ip); // 블랙리스트 등록
+    //         return true;                    // DROP
+    //     }
+    // }
+
+    return false; // 모든 검사 통과 -> ACCEPT
+}
+
+void PacketDetect::packet_ResetInline(unsigned char *pkt_data, int len, nfq_data *nfa, const pcap_t *adhandle)
+{
+    IpHeader *pSrcIpHeader = (IpHeader *)pkt_data;
+    int ipHeaderLen = (pSrcIpHeader->verIhl & 0x0F) * 4;
+    TcpHeader *pTcp = (TcpHeader *)(pkt_data + ipHeaderLen);
+    // 캡처한 IP 헤더에서 전체 길이를 가져와 TCP 페이로드 길이를 계산
+    // int ipLen = ntohs(pSrcIpHeader->length);
+    // int tcpHeaderLen = ((pTcp->data & 0xF0) >> 4) * 4;
+    int payloadLen = ntohs(pSrcIpHeader->length) - ((pSrcIpHeader->verIhl & 0x0F) * 4) - (((pTcp->data & 0xF0) >> 4) * 4);
+    // int payloadLen = ipLen - ipHeaderLen - tcpHeaderLen;
+
+    struct nfqnl_msg_packet_hw *mac = nfq_get_packet_hw(nfa);
+    if (mac)
+    {
+        uint64_t srcMacKey = 0;
+        srcMacKey = MacToUint64(mac->hw_addr);
+    }
+    for (int i = 0; i < 2; i++)
+    {
+
+        unsigned char frameData[60] = {0}; // 최소 패킷 사이즈
+        EtherHeader *pEtherHeader = (EtherHeader *)frameData;
+        IpHeader *pIpHeader = (IpHeader *)(frameData + sizeof(EtherHeader));
+        TcpHeader *pTcpHeader = (TcpHeader *)(frameData + sizeof(EtherHeader) + 20);
+
+        // 1. Ethernet 설정: 나(VM) -> 클라이언트(Windows)
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            memcpy(pEtherHeader->srcMac, mac->hw_addr, 6);
+            memcpy(pEtherHeader->dstMac, g_ctx.config.gateway_mac, 6);
+        }
+        else if (i == DESTINATION::DST_CLI) // 서버->클라
+        {
+            memcpy(pEtherHeader->srcMac, g_ctx.config.gateway_mac, 6); // 내 리눅스 MAC
+            memcpy(pEtherHeader->dstMac, mac->hw_addr, 6);             // 캡처된 패킷의 소스(클라) MAC
+        }
+        pEtherHeader->type = htons(0x0800);
+
+        // 2. IP 설정: 서버 -> 클라이언트
+        pIpHeader->verIhl = 0x45;
+        pIpHeader->length = htons(40);
+        pIpHeader->protocol = 6;
+        pIpHeader->ttl = 128;
+
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            memcpy(pIpHeader->srcIp, pSrcIpHeader->srcIp, 4);
+            memcpy(pIpHeader->dstIp, &g_ctx.config.server_ip_addr, 4);
+        }
+        else if (i == DESTINATION::DST_CLI)
+        {
+
+            memcpy(pIpHeader->srcIp, &g_ctx.config.server_ip_addr, 4); // 서버 IP (가짜 출발지)
+            memcpy(pIpHeader->dstIp, pSrcIpHeader->srcIp, 4);          // 클라이언트 IP
+        }
+        pIpHeader->checksum = CalcChecksumIp(pIpHeader);
+
+        pTcpHeader->data = 0x50;
+        pTcpHeader->flags = 0x04; // RST
+        pTcpHeader->windowSize = 0;
+        // 3. TCP 설정 (가장 중요)
+        if (i == DESTINATION::DST_SVR) // 클라 ->서버
+        {
+            pTcpHeader->srcPort = pTcp->srcPort;
+            pTcpHeader->dstPort = htons(g_ctx.config.server_port);
+            pTcpHeader->ack = pTcp->ack; // 기존 ACK 유지
+
+            uint32_t baseSeq = ntohl(pTcp->seq) + payloadLen;
+
+            // uint32_t s_nextSeq = ntohl(pTcp->seq) + payloadLen;
+            // pTcpHeader->seq = htonl(s_nextSeq);
+            // pTcpHeader->seq = pTcp->seq;
+            for (int burst = 0; burst < 3; burst++)
+            {
+                pTcpHeader->seq = htonl(baseSeq + (burst)); // 100바이트 간격으로 타격
+                pTcpHeader->checksum = 0;
+                pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+
+                pcap_sendpacket(const_cast<pcap_t *>(adhandle), frameData, 54);
+            }
+        }
+        else if (i == DESTINATION::DST_CLI)
+        {
+
+            pTcpHeader->srcPort = htons(g_ctx.config.server_port); // 서버 포트
+            pTcpHeader->dstPort = pTcp->srcPort;                   // 클라이언트 포트
+            // 캡처한 패킷의 ACK를 나의 SEQ로 사용 (상대방이 기다리는 번호)
+            pTcpHeader->seq = pTcp->ack;
+            pTcpHeader->ack = 0;
+            pTcpHeader->checksum = 0;
+            pTcpHeader->checksum = CalcChecksumTcp(pIpHeader, pTcpHeader);
+
+            // 4. 전송
+            pcap_sendpacket(const_cast<pcap_t *>(adhandle), frameData, 54);
+        }
+    }
+}
+
+void PacketDetect::UpdateXdpBlcaklist(uint32_t src_ip)
+{
+    uint32_t value = 1;
+    // m_xdp_map_fd는 프로그램 시작 시 오픈한 맵의 파일 디스크립터
+
+    if (g_ctx.m_xdp_map_fd == -1)
+    {
+        printf("m_xdp_map_fd = -1 !");
+    }
+
+    if (bpf_map_update_elem(g_ctx.m_xdp_map_fd, &src_ip, &value, BPF_ANY) != 0)
+    {
+        fprintf(stderr, "Failed to update XDP map\n");
+    }
+    else
+    {
+        printf("[XDP] IP %u added to Kernel Blacklist!\n", src_ip);
+    }
 }

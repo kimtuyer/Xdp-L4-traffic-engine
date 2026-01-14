@@ -62,6 +62,7 @@ struct SharedContext {
     std::atomic<int> g_syn_count{0};
     std::atomic<int> g_ack_count{0};
 
+    int m_xdp_map_fd{-1};  //XDP 사용하는 블랙리스트 맵 FD
 
     // 3. 설정 파일
     const NetworkConfig config;

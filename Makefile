@@ -1,33 +1,41 @@
 # 1. 컴파일러 및 옵션
 CC = gcc
 CXX = g++
+CLANG = clang  # eBPF 전용 컴파일러
 CFLAGS = -Wall -g
 CXXFLAGS = -Wall -g -std=c++20
-LDFLAGS = -lpcap -lpthread
+# libbpf, libelf 추가 필수!
+LDFLAGS = -lpcap -lpthread -lnetfilter_queue -lbpf -lelf 
 
 # 2. 빌드 대상 정의
 C_TARGETS = open read fcntl epoll
 CPP_TARGET = GameGuard
+BPF_TARGET = filter.bpf.o  # eBPF 바이트코드 타겟 추가
 
 # 3. gameguard 폴더 내 소스 파일들
-# 폴더 경로를 명시하여 빌드 대상에 포함합니다.
 GAMEGUARD_DIR = gameguard
 GAMEGUARD_SRCS = $(wildcard $(GAMEGUARD_DIR)/*.cpp)
 GAMEGUARD_OBJS = $(GAMEGUARD_SRCS:.cpp=.o)
+BPF_SRCS = $(GAMEGUARD_DIR)/filter.bpf.c # eBPF 소스 경로
 
-all: $(C_TARGETS) $(CPP_TARGET)
+# all 에 BPF_TARGET 추가
+all: $(BPF_TARGET) $(C_TARGETS) $(CPP_TARGET)
 
-# 기존 C 파일 빌드 (패턴 매칭)
+# [추가] eBPF 커널 코드 컴파일 규칙
+$(BPF_TARGET): $(BPF_SRCS)
+	$(CLANG) -O2 -g -target bpf -c $< -o $@
+
+# 기존 C 파일 빌드
 $(C_TARGETS): %: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# GameGuardian 빌드
+# GameGuard 빌드
 $(CPP_TARGET): $(GAMEGUARD_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 # .cpp 파일을 .o 파일로 만드는 규칙
-%.o: %.cpp gameguard/define.h
+%.o: %.cpp $(GAMEGUARD_DIR)/define.h
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(C_TARGETS) $(CPP_TARGET) $(GAMEGUARD_DIR)/*.o *.o
+	rm -f $(C_TARGETS) $(CPP_TARGET) $(BPF_TARGET) $(GAMEGUARD_DIR)/*.o *.o

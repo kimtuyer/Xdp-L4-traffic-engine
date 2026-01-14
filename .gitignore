@@ -9,3 +9,11 @@
 /read
 /read.c
 /test.txt
+gameguard/PcapManager.o
+gameguard/PacketMonitor.o
+gameguard/PacketDetect.o
+gameguard/PacketCapture.o
+gameguard/GameGuard.o
+gameguard/DataLoader.o
+filter.bpf.o
+GameGuard
