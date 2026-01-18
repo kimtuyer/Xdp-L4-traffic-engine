@@ -4,7 +4,7 @@
 #include <bpf/bpf.h>
 // #include "Global.h"
 
-PacketDetect::PacketDetect(SharedContext &context, int mode) : g_ctx(context), m_mode(mode)
+PacketDetect::PacketDetect(SharedContext &context, int mode, bool bXDP) : g_ctx(context), m_mode(mode), XDP(bXDP)
 {
     if (mode == eMode::MODE_PCAP)
     {
@@ -15,9 +15,26 @@ PacketDetect::PacketDetect(SharedContext &context, int mode) : g_ctx(context), m
 
 PacketDetect::~PacketDetect()
 {
-    for (int i = 0; i < NUM_WORKER_THREADS; i++)
-        if (ThreadPool[i].joinable())
-            ThreadPool[i].join();
+
+    g_ctx.g_bRunning = false;
+    for (auto &t : ThreadPool)
+    {
+        // t 자체가 유효하고 join 가능한 상태인지 확인
+        if (t.joinable())
+        {
+            try
+            {
+                t.join();
+            }
+            catch (...)
+            {
+                // join 과정에서의 예외 방지
+            }
+        }
+    }
+    // for (int i = 0; i < NUM_WORKER_THREADS; i++)
+    //     if (ThreadPool[i].joinable())
+    //         ThreadPool[i].join();
 }
 
 void PacketDetect::packet_detect(const int ThreadID, const pcap_t *adhandle)
@@ -372,13 +389,32 @@ void PacketDetect::packet_Reset(const TcpHeader *pTcp, const u_char *pktdata, co
 bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_data *nfa)
 {
 
+    if (!pkt_data || len < sizeof(IpHeader))
+    {
+        printf("Packet Length IP > Short!\n");
+        return false; //
+    }
+
     IpHeader *pIpHeader = (IpHeader *)pkt_data;
 
     uint32_t src_ip = *(uint32_t *)(pIpHeader->srcIp);
 
     int ipHeaderLen = (pIpHeader->verIhl & 0x0F) * 4;
+
+    // hping3 테스트 공격 경험 인한 방어코드 추가
+    int min_len = ipHeaderLen + sizeof(TcpHeader);
+    if (min_len > len)
+    {
+        // 패킷이 너무 짧아 TCP 헤더를 읽을 수 없음
+        printf("Packet Length  TCP >Short!\n");
+        return true; // 안전하게 DROP
+    }
     TcpHeader *pTcp = (TcpHeader *)(pkt_data + ipHeaderLen);
 
+    // 공격시 ping 테스트하는 내 호스트 ip는 통과!
+    uint32_t my_host_ip = inet_addr("192.168.21.1");
+    if (src_ip == my_host_ip)
+        return false;
     // SSH 패킷은 차단 대상에서 제외!
     if (ntohs(pTcp->dstPort) == 22 || ntohs(pTcp->srcPort) == 22)
     {
@@ -400,41 +436,12 @@ bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_da
             g_ctx.g_emergency_mode = true;
         }
     }
-    // // 테스트를 위해, 첫 클라이언트 서버 연결은 허용!
-    // if (pTcp->flags & 0x02)
-    // {
-    //     return false;
-    // }
-
-    // printf("Received Packet from: %u\n", src_ip);
-    //  // 데이터가 들어있는 패킷(채팅 내용 등)만 차단하고 싶다면:
-    //  int payloadLen = ntohs(pIpHeader->length) - ipHeaderLen - (pTcp->data >> 4) * 4;
-    //  if (payloadLen > 0)
-    //  {
-    //      printf("[BLOCK] Data Packet Detected (Len: %d). Dropping...\n", payloadLen);
-    //      // 여기서 Reset을 쏘면 클라이언트가 즉시 튕깁니다.
-    //      // packet_ResetInline(pkt_data, len, nfa, adhandle);
-    //      return true; // DROP
-    //  }
-
-    // if (mac)
-    // {
-    //     uint64_t srcMacKey = MacToUint64(mac->hw_addr);
-    //     std::shared_lock<std::shared_mutex> lock(m_statsMutex);
-    //     m_mac_stat[srcMacKey]++;
-
-    //     if (m_mac_stat[srcMacKey] > 500)
-    //     {
-    //                 return true;
-    //         // 특정 MAC 전체 차단 정책 등 수행
-    //     }
-    // }
 
     // 1. 주기적 카운트 초기화 (동기식)
     auto now = std::chrono::steady_clock::now();
     {
-        // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
-        std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+        std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+        // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
         if (chrono::duration_cast<std::chrono::seconds>(now - m_last_check_time).count() >= 1)
         {
             m_last_check_time = now;
@@ -445,67 +452,75 @@ bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_da
     // 2. 패킷 정보 업데이트 (인라인 카운팅)
     // 인라인 모드에서는 실시간으로 accumlate_stat에 바로 기록합니다.
     {
-        // std::unique_lock<std::shared_mutex> lock(m_statsMutex);
-        std::lock_guard<std::mutex> lock(m_statsMutex);
-        m_accumulate_stat[src_ip].TotalCount++;
+        // std::lock_guard<std::mutex> lock(m_statsMutex);
+        std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+        // std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
+        auto &stat = m_accumulate_stat[src_ip];
+        stat.TotalCount++;
         if (pTcp->flags & 0x02)
-            m_accumulate_stat[src_ip].syn_count++;
+            stat.syn_count++;
     }
 
     // 3. 탐지 로직 (기존 if-else 구조 유지)
 
     {
-        // std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
-        std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
 
+        // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+        std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
         // [검사 1] 블랙리스트 여부 확인 (가장 빠름)
         if (local_blacklist.contains(src_ip))
         {
-            printf("blacklist drp: %u\n", src_ip);
-
+            // printf("blacklist drp: %u\n", src_ip);
+            lock.unlock();
             return true; // 즉시 DROP
         }
 
-        if (m_accumulate_stat[src_ip].syn_count > 10 ||
-            m_accumulate_stat[src_ip].TotalCount > 100)
+        //[검사 2] SYN Flood / DDoS 임계치 체크
+        auto it = m_accumulate_stat.find(src_ip); // 안전한 읽기
+        if (it != m_accumulate_stat.end())
         {
-            // read_lock.unlock();
-            printf("[BLOCK] SYN Flood Detected from IP: %u. Dropping...\n", src_ip);
-            // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
-            // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
-
-            local_blacklist.insert(src_ip); // 블랙리스트 등록
-            UpdateXdpBlcaklist(src_ip);
-
-            return true; // DROP
+            if (it->second.syn_count > 10 || it->second.TotalCount > 100)
+            {
+                lock.unlock();
+                // printf("[BLOCK] SYN Flood Detected from IP: %u. Dropping...\n", src_ip);
+                std::unique_lock<std::shared_mutex> u_lock(m_shared_statsMutex);
+                // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+                local_blacklist.insert(src_ip); // 블랙리스트 등록
+                if (XDP)
+                {
+                    UpdateXdpBlcaklist(src_ip);
+                }
+                return true; // DROP
+            }
         }
     }
 
-    // [검사 2] Emergency Mode (First Drop / Greylist 로직)
+    // [검사 3] Emergency Mode (First Drop / Greylist 로직)
     if (g_ctx.g_emergency_mode)
     {
         if (pTcp->flags & 0x02)
         { // SYN 패킷일 때만
             {
-                // std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
-                std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
-                                                                // std::shared_lock<std::shared_mutex> lock(m_statsMutex);
+                std::shared_lock<std::shared_mutex> lock(m_shared_statsMutex);
+                // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+                //  std::shared_lock<std::shared_mutex> lock(m_statsMutex);
 
                 if (m_whitelist.contains(src_ip))
                 {
-                    printf("whitelist Pass: %u\n", src_ip);
+                    lock.unlock();
+                    // printf("whitelist Pass: %u\n", src_ip);
                     return false; // 허용
                 }
             }
 
             {
-                // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
-                std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
+                std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
+                // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
 
                 if (m_greylist.contains(src_ip))
                 {
 
-                    printf("whitelist insert: %u\n", src_ip);
+                    // printf("whitelist insert: %u\n", src_ip);
 
                     m_greylist.erase(src_ip);
                     m_whitelist.insert(src_ip);
@@ -514,30 +529,14 @@ bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_da
                 else
                 {
                     // First Drop: 기록만 하고 패킷은 버림
-                    m_greylist[src_ip] = now;
-                    printf("greylist insert: %u\n", src_ip);
+                    m_greylist.insert({src_ip, now});
+                    // printf("greylist insert: %u\n", src_ip);
 
                     return true; // DROP
                 }
             }
         }
     }
-    // // [검사 3] SYN Flood / DDoS 임계치 체크
-    // {
-    //     std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
-    //     // std::shared_lock<std::shared_mutex> read_lock(m_shared_statsMutex);
-    //     if (m_accumulate_stat[src_ip].syn_count > 10 ||
-    //         m_accumulate_stat[src_ip].TotalCount > 100)
-    //     {
-    //         // read_lock.unlock();
-    //         printf("[BLOCK] SYN Flood Detected from IP: %u. Dropping...\n", src_ip);
-    //         // std::unique_lock<std::shared_mutex> lock(m_shared_statsMutex);
-    //         // std::lock_guard<std::mutex> lock(m_statsMutex); // 통계 데이터 보호
-
-    //         local_blacklist.insert(src_ip); // 블랙리스트 등록
-    //         return true;                    // DROP
-    //     }
-    // }
 
     return false; // 모든 검사 통과 -> ACCEPT
 }

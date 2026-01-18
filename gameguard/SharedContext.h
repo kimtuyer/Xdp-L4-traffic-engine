@@ -46,6 +46,7 @@ struct WorkerContext {
 
 // 워커 스레드들이 공유할 모든 자원
 struct SharedContext {
+    atomic<bool>g_bRunning{true};
     // 1. 데이터 큐
     //std::vector<std::map<uint32_t, std::pair<Packet, int>>> worker_queues;
     std::vector<std::unique_ptr<WorkerContext>> workers;

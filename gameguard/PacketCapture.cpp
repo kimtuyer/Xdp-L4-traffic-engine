@@ -178,12 +178,10 @@ int PacketCapture::nfq_callback(nfq_q_handle *qh, nfgenmsg *nfmsg, nfq_data *nfa
 		IpHeader *pIpHeader = (IpHeader *)pkt_data;
 		uint32_t src_ip = *(uint32_t *)(pIpHeader->srcIp);
 
-		printf("[BLOCK] IP: %u, Verdict: DROP\n", src_ip);
+		// printf("[BLOCK] IP: %u, Verdict: DROP\n", src_ip);
 		self->m_pDetect->packet_ResetInline(pkt_data, len, nfa, PcapAdmin.GetHandle());
 		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 	}
-
-
 	else
 	{
 		// 정상이면 ACCEPT!
@@ -227,6 +225,14 @@ void PacketCapture::_RunNetfilter(int queue_num)
 		fprintf(stderr, "error during nfq_create_queue()\n");
 		return;
 	}
+	else
+	{
+		// 큐의 길이를 기존 1024에서 10,000으로 대폭 확대
+		if (nfq_set_queue_maxlen(qh, 10000) < 0)
+		{
+			fprintf(stderr, "can't set queue maxlen\n");
+		}
+	}
 
 	// 4. 패킷 카피 모드 설정 (패킷 전체 내용을 유저 모드로 가져옴)
 	if (nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0)
@@ -238,10 +244,70 @@ void PacketCapture::_RunNetfilter(int queue_num)
 	// 5. 소켓 파일 디스크립터 가져오기 및 루프
 	fd = nfq_fd(h);
 
-	while ((rv = recv(fd, buf, sizeof(buf), 0)) >= 0)
-	{
-		// nfq_handle_packet이 내부적으로 nfq_callback을 호출함
-		nfq_handle_packet(h, buf, rv);
+	while (ctx.g_bRunning)
+	{ // 종료 플래그 확인
+
+		rv = recv(fd, buf, sizeof(buf), 0);
+		if (rv >= 0)
+		{
+			if (nfq_handle_packet(h, buf, rv) < 0)
+			{
+				// nfq_handle_packet 내부 에러(주로 오버플로우) 시 계속 진행
+				continue;
+			}
+		}
+		else
+		{
+			// 에러 처리 세분화
+			if (errno == EINTR)
+			{
+				continue;
+			}
+			if (errno == ENOBUFS)
+			{
+				//핵심: 큐가 꽉 찼을 때는 break 하지 않고 경고만 찍고 계속 진행
+				fprintf(stderr, "[Warn] NFQUEUE Buffer Overflow (ENOBUFS)\n");
+				continue;
+			}
+
+			// 정말 심각한 에러(EBADF 등)일 때만 종료
+			fprintf(stderr, "[Critical] Socket error: %s\n", strerror(errno));
+			break;
+		}
+		// try
+		// {
+		// 	rv = recv(fd, buf, sizeof(buf), 0);
+		// 	if (rv >= 0)
+		// 	{
+		// 		// 패킷 처리 중 발생하는 내부 에러가 루프를 깨지 않도록 보호
+		// 		if (nfq_handle_packet(h, buf, rv) < 0)
+		// 		{
+		// 			// 큐 오버플로우 등으로 인한 에러 발생 시 로그만 남기고 계속 진행
+		// 			fprintf(stderr, "[Warn] nfq_handle_packet error\n");
+		// 			continue;
+		// 		}
+		// 	}
+		// 	else if (rv < 0 && errno == EINTR)
+		// 	{
+		// 		continue; // 시그널에 의한 중단은 무시
+		// 	}
+		// 	else if (errno == ENOBUFS)
+		// 	{
+		// 		// 👈 핵심: 큐가 꽉 찼을 때는 break 하지 않고 경고만 찍고 계속 진행
+		// 		// fprintf(stderr, "[Warn] NFQUEUE Buffer Overflow (ENOBUFS)\n");
+		// 		continue;
+
+		// 	}
+		// 	else
+		// 	{
+
+		// 	}
+		// }
+		// catch (...)
+		// {
+		// 	// 모든 예기치 못한 예외 상황에서 스레드가 죽지 않도록 방어
+		// 	continue;
+		// }
 	}
 
 	// 정리
@@ -285,9 +351,7 @@ void PacketCapture::_packet_AddSumCnt(unsigned char *pkt_data)
 		ctx.g_syn_count++;
 	if (ack_count == 1)
 		ctx.g_ack_count++;
-	
 }
-
 
 void PacketCapture::_RunPcap()
 {

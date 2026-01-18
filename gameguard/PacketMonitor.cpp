@@ -5,27 +5,28 @@
 #include "PacketDetect.h"
 #include <csignal>
 
-PacketMonitor* PacketMonitor::instance = nullptr;
-PacketMonitor::PacketMonitor(const NetworkConfig &config, int mode)
-	: m_mode(mode)
+PacketMonitor *PacketMonitor::instance = nullptr;
+PacketMonitor::PacketMonitor(const NetworkConfig &config, int mode, bool XDP)
+	: m_mode(mode), bXDP(XDP)
 {
-	instance=this;
+	instance = this;
 	// worker_queues.resize(NUM_WORKER_THREADS);
 
 	std::signal(SIGINT, PacketMonitor::signal_handler);
 
 	m_context = make_unique<SharedContext>(config);
-	m_packetDetect = make_unique<PacketDetect>(*m_context,m_mode);
 
-	if(m_mode==eMode::MODE_NETFILTER)
-	{		
-		m_netfilterCapture = make_unique<PacketCapture>(*m_context,m_packetDetect.get(),m_mode);
+	m_context->g_bRunning=true;
+	m_packetDetect = make_unique<PacketDetect>(*m_context, m_mode, XDP);
+
+	if (m_mode == eMode::MODE_NETFILTER)
+	{
+		m_netfilterCapture = make_unique<PacketCapture>(*m_context, m_packetDetect.get(), m_mode);
 	}
 	else
 	{
-		m_packetCapture = make_unique<PacketCapture>(*m_context,m_packetDetect.get(),m_mode);
+		m_packetCapture = make_unique<PacketCapture>(*m_context, m_packetDetect.get(), m_mode);
 	}
-	
 }
 
 PacketMonitor::~PacketMonitor()
@@ -45,16 +46,18 @@ bool PacketMonitor::Initialize()
 	return true;
 }
 
-void PacketMonitor::Run()
+void PacketMonitor::Run(char *NicDriverName)
 {
 
-	#ifdef __XDP__
-	if(LoadXDP("filter.bpf.o","ens33")==false)
+#ifdef __XDP__
+	if (bXDP)
 	{
-		printf("XDP Load Failed!\n");
-		return;
+		if (LoadXDP("filter.bpf.o", NicDriverName) == false)
+		{
+			printf("XDP Load Failed on device: %s\n", NicDriverName);
+			return;
+		}
 	}
-
 #endif
 	if (m_mode == MODE_NETFILTER)
 	{
@@ -77,55 +80,60 @@ bool PacketMonitor::LoadXDP(const char *bpf_file, const char *if_name)
 {
 
 	int prog_fd;
-    
-    // 1. 오브젝트 파일 로드
-    m_bpf_obj = bpf_object__open_file(bpf_file, NULL);
-    if (!m_bpf_obj) return false;
 
-    if (bpf_object__load(m_bpf_obj)) return false;
+	// 1. 오브젝트 파일 로드
+	m_bpf_obj = bpf_object__open_file(bpf_file, NULL);
+	if (!m_bpf_obj)
+		return false;
 
-    // 2. 프로그램 FD 가져오기
-    struct bpf_program* prog = bpf_object__find_program_by_name(m_bpf_obj, "xdp_filter_main");
-    prog_fd = bpf_program__fd(prog);
+	if (bpf_object__load(m_bpf_obj))
+		return false;
 
-    // 3. 인터페이스(ens33 등)에 XDP 장착
-    int ifindex = if_nametoindex(if_name);
-    if (bpf_set_link_xdp_fd(ifindex, prog_fd, 0) < 0) {
-        fprintf(stderr, "Error: Failed to attach XDP to %s\n", if_name);
-        return false;
-    }
+	// 2. 프로그램 FD 가져오기
+	struct bpf_program *prog = bpf_object__find_program_by_name(m_bpf_obj, "xdp_filter_main");
+	prog_fd = bpf_program__fd(prog);
 
-	
-    // 4. 블랙리스트 맵 FD 저장 (가장 중요!)
-    m_context->m_xdp_map_fd = bpf_object__find_map_fd_by_name(m_bpf_obj, "blacklist_map");
+	// 3. 인터페이스(ens33 등)에 XDP 장착
+	int ifindex = if_nametoindex(if_name);
+	if (bpf_set_link_xdp_fd(ifindex, prog_fd, 0) < 0)
+	{
+		fprintf(stderr, "Error: Failed to attach XDP to %s\n", if_name);
+		return false;
+	}
 
-    printf("[System] XDP filter attached to %s (Map FD: %d)\n", if_name, m_context->m_xdp_map_fd);
-    return true;
-    
+	// 4. 블랙리스트 맵 FD 저장 (가장 중요!)
+	m_context->m_xdp_map_fd = bpf_object__find_map_fd_by_name(m_bpf_obj, "blacklist_map");
+
+	printf("[System] XDP filter attached to %s (Map FD: %d)\n", if_name, m_context->m_xdp_map_fd);
+	return true;
 }
 
 void PacketMonitor::UnloadXDP(const char *if_name)
 {
 
 	int ifindex = if_nametoindex(if_name);
-    if (ifindex == 0) return;
+	if (ifindex == 0)
+		return;
 
-    // FD에 -1을 주거나 0을 세팅하여 XDP 프로그램을 제거합니다.
-    // 최신 libbpf에서는 bpf_set_link_xdp_fd(ifindex, -1, 0) 를 주로 사용합니다.
-    if (bpf_set_link_xdp_fd(ifindex, -1, 0) < 0) {
-        fprintf(stderr, "[Warning] XDP 언로드 실패: %s\n", if_name);
-    } else {
-        printf("[System] XDP filter successfully detached from %s\n", if_name);
-    }
+	// FD에 -1을 주거나 0을 세팅하여 XDP 프로그램을 제거합니다.
+	// 최신 libbpf에서는 bpf_set_link_xdp_fd(ifindex, -1, 0) 를 주로 사용합니다.
+	if (bpf_set_link_xdp_fd(ifindex, -1, 0) < 0)
+	{
+		fprintf(stderr, "[Warning] XDP 언로드 실패: %s\n", if_name);
+	}
+	else
+	{
+		printf("[System] XDP filter successfully detached from %s\n", if_name);
+	}
 }
 
 void PacketMonitor::signal_handler(int signal)
 {
 	printf("\n[System] 종료 시그널 감지. 자원 정리 중...\n");
-	if(instance)
+	if (instance)
 	{
 		instance->UnloadXDP("ens33");
 	}
 	// ("ens33"); // 여기서 인터페이스 이름을 줍니다.
-    exit(signal);
+	exit(signal);
 }

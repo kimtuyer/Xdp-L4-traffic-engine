@@ -12,11 +12,11 @@ class PacketMonitor
 public:
 
 	//PacketMonitor();
-	PacketMonitor(const NetworkConfig& config,int mode);
+	PacketMonitor(const NetworkConfig& config,int mode ,bool bXDP);
 	~PacketMonitor();
 
 	bool Initialize();
-	void Run();
+	void Run(char* NicDriverName);
 
 	bool LoadXDP(const char* bpf_file, const char* if_name);
 	void UnloadXDP(const char* if_name);
@@ -34,10 +34,11 @@ private:
 	unique_ptr<PacketDetect> m_packetDetect;
 
 	bool bRunnig{true};
+	bool bXDP;
 
 	unique_ptr<SharedContext> m_context;
 	bpf_object* m_bpf_obj;
 
-	int m_mode{0};
+	int m_mode;
 };
 
