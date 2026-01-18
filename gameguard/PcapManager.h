@@ -9,7 +9,7 @@ public:
 	PcapManager();
 	~PcapManager();
 
-	bool SetDevice();
+	bool SetDevice(char* selectDeviceName);
 	bool CreateHandle(const pcap_if_t* d, const pcap_if_t* alldevs, char errbuf[PCAP_ERRBUF_SIZE]);
 
 	const NetworkConfig& GetConfig();

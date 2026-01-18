@@ -9,7 +9,7 @@ PcapManager::~PcapManager()
     	pcap_close(adhandle);
 }
 
-bool PcapManager::SetDevice()
+bool PcapManager::SetDevice(char* selectDeviceName )
 {
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_if_t *d{};
@@ -51,8 +51,10 @@ bool PcapManager::SetDevice()
     }
 
     /* Jump to the selected adapter */
-    for (d = alldevs, i = 0; i < inum - 1; d = d->next, i++)
-        ;
+    for (d = alldevs, i = 0; i < inum - 1; d = d->next, i++);
+
+    /* 찾은 드라이버 이름을 인자로 받은 버퍼에 복사 (예: ens33) */
+    strcpy(selectDeviceName, d->name);
 
     return CreateHandle(d, alldevs, errbuf);
 }
@@ -76,7 +78,7 @@ bool PcapManager::CreateHandle(const pcap_if_t *d, const pcap_if_t *alldevs, cha
     pcap_set_snaplen(adhandle, 65536); // 캡처할 패킷 부분 (스냅 길이)
     pcap_set_promisc(adhandle, 1);     // 무차별 모드
     pcap_set_timeout(adhandle, 1);     // 읽기 타임아웃 (1ms)
-    pcap_set_immediate_mode(adhandle, 1); // activate 이전으로 이동 추천
+    pcap_set_immediate_mode(adhandle, 1);
     /* 4. pcap_activate로 디바이스를 활성화합니다. */
     int activate_status = pcap_activate(adhandle);
     if (activate_status != 0)

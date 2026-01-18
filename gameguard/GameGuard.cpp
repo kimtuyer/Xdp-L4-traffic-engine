@@ -449,6 +449,8 @@ int main()
 {
 
 	int mode = 0;
+	int answer=0;
+	bool XDP=false;
 
 #ifdef __LINUX__
 	printf("Select Operation Mode:\n");
@@ -456,6 +458,13 @@ int main()
 	printf("2. Inline Prevention (Netfilter)\n");
 	printf("Choice: "); 
 	scanf("%d", &mode);
+
+	printf("Select Number Enable to XDP Mode: \n");
+	printf("1.Y\n");
+	printf("2.N\n");
+	scanf("%d", &answer);
+	answer==1 ? XDP=true : XDP=false;
+
 #else
 	mode = eMode::MODE_PCAP;
 	if (!LoadNpcapDlls())
@@ -464,13 +473,14 @@ int main()
 		exit(1);
 	}
 #endif //__LINUX__
-	if (PcapAdmin.SetDevice() == false)
+	char selectDeviceName[256];
+	if (PcapAdmin.SetDevice(selectDeviceName) == false)
 	{
 		return -1;
 	}
 
-	PacketMonitor pMonitor(PcapAdmin.GetConfig(), mode);	
-	pMonitor.Run();
+	PacketMonitor pMonitor(PcapAdmin.GetConfig(), mode,XDP);	
+	pMonitor.Run(selectDeviceName);
 	/*if (pMonitor.Initialize())
 		pMonitor.Run();
 	else
