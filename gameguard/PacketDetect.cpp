@@ -473,8 +473,7 @@ bool PacketDetect::packet_AnalyzeInline(unsigned char *pkt_data, int len, nfq_da
             struct in_addr ip_addr;
             ip_addr.s_addr = (uint32_t)src_ip;
             //printf("XDP DROP -> IP: %s\n", inet_ntoa(ip_addr));
-            printf("XDP DROP -> IP: %s\n", inet_ntoa(ip_addr));
-            //printf("blacklist drop: %u\n", src_ip);
+            printf("blacklist drop: %u\n", src_ip);
             lock.unlock();
             return true; // 즉시 DROP
         }

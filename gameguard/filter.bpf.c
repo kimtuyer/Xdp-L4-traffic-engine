@@ -5,13 +5,17 @@
 #include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h> // 이 헤더가 있으면 __bpf_htonl 사용 가능
-#define __XDP_GLOBAL__
+#define __XDP_GLOBAL__ //Rand-IP 공격에 대응하기 위한 글로벌 맵 정의
+//#define __PERCPU__ // 다중 CPU 코어별 카운팅
 
 #ifdef __XDP_GLOBAL__
-// 2. Rand-IP 공격에 대응하기 위한 글로벌 맵 정의
 struct
 {
+#ifdef __PERCPU__
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); // 단일 값을 저장하기 위해 Array 사용
+#else
     __uint(type, BPF_MAP_TYPE_ARRAY); // 단일 값을 저장하기 위해 Array 사용
+#endif
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u64);
@@ -62,10 +66,14 @@ int xdp_filter_main(struct xdp_md *ctx)
     __u32 src_ip = iph->saddr;
     if (total_count)
     {
+#ifdef __PERCPU__
+        *total_count += 1;
+#else
         __sync_fetch_and_add(total_count, 1);
-        //char fmt1[] = "total count:%llu\n";
-        //bpf_trace_printk(fmt1, sizeof(fmt1), *total_count);
-        if (*total_count > 5000)
+#endif
+        // char fmt1[] = "total count:%llu\n";
+        // bpf_trace_printk(fmt1, sizeof(fmt1), *total_count);
+        if (*total_count > 2500)
         { // 초당 전체 SYN이 1만개를 넘으면
             char fmt[] = "DROP TRIGGERED! count:%llu\n";
             bpf_trace_printk(fmt, sizeof(fmt), *total_count);
