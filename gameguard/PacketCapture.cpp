@@ -1,7 +1,7 @@
 #include "PacketCapture.h"
 #include "PacketDetect.h"
 #include <cstdlib>
-
+#include <sys/sysinfo.h> // get_nprocs() 사용
 // #include "Global.h"
 
 PacketCapture::PacketCapture(SharedContext &context, PacketDetect *pDetect, int mode) : ctx(context), m_mode(mode), m_pDetect(pDetect)
@@ -136,14 +136,26 @@ void PacketCapture::Run()
 	thread timerThread([this]()
 					   {
         uint32_t key = 0;
-        uint64_t zero = 0;
+        //uint64_t zero = 0;
+		int nr_cpus = get_nprocs(); // 현재 시스템의 CPU 코어 수
+
+		// CPU 개수만큼 0으로 채운 배열 준비
+    	__u64 zero_values[nr_cpus]; 
+    	memset(zero_values, 0, sizeof(zero_values));
+		bpf_map_update_elem(ctx.m_xdp_global_map_fd, &key, zero_values, BPF_ANY);
+		//bpf_map_update_elem(ctx.m_xdp_global_map_fd, &key, &zero, BPF_ANY);
         while (true) {
             this_thread::sleep_for(chrono::seconds(1)); // 1초 대기
             // global_pps_map의 0번 인덱스를 0으로 초기화
-			//uint64_t current_pps;
-            //bpf_map_lookup_elem(ctx.m_xdp_map_fd, &key, &current_pps);
-			//printf("Current PPS: %llu\n", current_pps);
-            bpf_map_update_elem(ctx.m_xdp_map_fd, &key, &zero, BPF_ANY);
+
+		if (bpf_map_update_elem(ctx.m_xdp_global_map_fd, &key, zero_values, BPF_ANY) != 0) {
+        	perror("Failed to reset PERCPU map");
+    		}
+            //bpf_map_update_elem(ctx.m_xdp_global_map_fd, &key, &zero, BPF_ANY);
+			// 2. 유저모드 통계 초기화 (Lock은 여기서 딱 한 번)        
+           m_pDetect->ResetAccumulateStat();
+        
+
             
             // (선택사항) 현재 PPS 로그 출력해서 모니터링
         } });
@@ -337,16 +349,33 @@ void PacketCapture::SetupIptables(int num_queues, int port)
 {
 	// 1. 기존 규칙 초기화 (안전을 위해 해당 포트 관련 규칙만 삭제하거나 전체 초기화)
 	// sudo iptables -D INPUT -p tcp --dport 25000 -j NFQUEUE ... (기존 규칙이 있다면)
+	system("sudo iptables -F INPUT"); // 테스트 환경이라면 전체 초기화가 깔끔합니다.
 
-	// 2. NFQUEUE 규칙 추가 (0번부터 num_queues-1번까지 부하 분산)
-	std::string cmd = "sudo iptables -A INPUT -p tcp --dport " + std::to_string(port) +
-					  " -j NFQUEUE --queue-balance 0:" + std::to_string(num_queues - 1);
+	// 2. NFQUEUE 규칙 추가 (0번부터 num_queues-1번까지 부하 분산) 대표 포트 (25000) 등록
+	std::string base_cmd = "sudo iptables -A INPUT -p tcp --dport " + std::to_string(port) +
+						   " -j NFQUEUE --queue-balance 0:" + std::to_string(num_queues - 1);
 
-	printf("[System] Setting up iptables: %s\n", cmd.c_str());
-	if (system(cmd.c_str()) != 0)
+	if (system(base_cmd.c_str()) != 0)
 	{
 		fprintf(stderr, "Failed to set iptables rule. Check sudo privileges.\n");
 	}
+
+	// 3. 백엔드 서버 포트들 (25001, 25002, 25003...) 추가 등록
+	// XDP에 의해 이미 포트가 바뀐 패킷들도 NFQUEUE로 들어오게 합니다.
+	for (int i = 1; i <= 4; ++i)
+	{ // SERVER_CNT가 4이라고 가정
+		int backend_port = port + i;
+		std::string backend_cmd = "sudo iptables -A INPUT -p tcp --dport " + std::to_string(backend_port) +
+								  " -j NFQUEUE --queue-balance 0:" + std::to_string(num_queues - 1);
+		system(backend_cmd.c_str());
+		printf("[System] Added backend port to iptables: %d\n", backend_port);
+	}
+
+	// printf("[System] Setting up iptables: %s\n", cmd.c_str());
+	//  if (system(cmd.c_str()) != 0)
+	//  {
+	//  	fprintf(stderr, "Failed to set iptables rule. Check sudo privileges.\n");
+	//  }
 }
 
 void PacketCapture::CleanupIptables()
